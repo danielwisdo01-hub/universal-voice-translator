@@ -6,7 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
@@ -28,6 +30,24 @@ class FloatingTranslatorService : Service() {
     private var bubble: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
     private val preferences by lazy { getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE) }
+    private val restoreReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (Settings.canDrawOverlays(this@FloatingTranslatorService) && preferences.getBoolean(KEY_ENABLED, false)) {
+                bubble?.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        val filter = IntentFilter(ACTION_RESTORE_AFTER_CAPTURE)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(restoreReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(restoreReceiver, filter)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -45,6 +65,8 @@ class FloatingTranslatorService : Service() {
             startAsForegroundService()
             if (bubble == null) {
                 showBubble()
+            } else {
+                bubble?.visibility = View.VISIBLE
             }
             preferences.edit().putBoolean(KEY_ENABLED, true).apply()
         } catch (_: Exception) {
@@ -57,6 +79,7 @@ class FloatingTranslatorService : Service() {
     override fun onDestroy() {
         removeBubble()
         preferences.edit().putBoolean(KEY_ENABLED, false).apply()
+        runCatching { unregisterReceiver(restoreReceiver) }
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -94,7 +117,7 @@ class FloatingTranslatorService : Service() {
             textSize = 21f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            contentDescription = "Open Universal Translator. Drag to move."
+            contentDescription = "Capture screen text for translation. Drag to move."
             isClickable = true
             elevation = dp(8).toFloat()
             background = GradientDrawable().apply {
@@ -102,7 +125,10 @@ class FloatingTranslatorService : Service() {
                 setColor(Color.rgb(8, 127, 116))
                 setStroke(dp(2), Color.WHITE)
             }
-            setOnClickListener { openTranslator() }
+            setOnClickListener {
+                hideBubbleForCapture()
+                openScreenCapture()
+            }
         }
         installDragHandling(view, params, manager, size)
         manager.addView(view, params)
@@ -170,6 +196,18 @@ class FloatingTranslatorService : Service() {
         startActivity(launchIntent)
     }
 
+    private fun openScreenCapture() {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+            ?: Intent(this, MainActivity::class.java)
+        launchIntent.action = ScreenTranslationService.ACTION_REQUEST_CAPTURE
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        startActivity(launchIntent)
+    }
+
+    private fun hideBubbleForCapture() {
+        bubble?.visibility = View.INVISIBLE
+    }
+
     private fun buildNotification(): Notification {
         val openIntent = Intent(this, MainActivity::class.java)
         val openPendingIntent = PendingIntent.getActivity(
@@ -188,7 +226,7 @@ class FloatingTranslatorService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setContentTitle("Floating translator is on")
-            .setContentText("Tap the button to open the translator, or hide it here.")
+            .setContentText("Tap the floating button to capture screen text, or hide it here.")
             .setContentIntent(openPendingIntent)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -240,6 +278,7 @@ class FloatingTranslatorService : Service() {
 
     companion object {
         const val ACTION_HIDE = "com.universalvoicetranslator.action.HIDE_FLOATING_BUTTON"
+        const val ACTION_RESTORE_AFTER_CAPTURE = "com.universalvoicetranslator.action.RESTORE_FLOATING_BUTTON"
         const val PREFERENCES = "floating_translator"
         const val KEY_ENABLED = "enabled"
         private const val KEY_X = "x"
@@ -258,6 +297,11 @@ class FloatingTranslatorService : Service() {
 
         fun hide(context: Context) {
             context.stopService(Intent(context, FloatingTranslatorService::class.java))
+        }
+
+        fun restoreAfterCapture(context: Context) {
+            val restoreIntent = Intent(ACTION_RESTORE_AFTER_CAPTURE).setPackage(context.packageName)
+            context.sendBroadcast(restoreIntent)
         }
 
         fun isEnabled(context: Context): Boolean = context

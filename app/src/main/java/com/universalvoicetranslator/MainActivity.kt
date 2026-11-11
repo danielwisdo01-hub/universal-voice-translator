@@ -1,11 +1,14 @@
 package com.universalvoicetranslator
 
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.content.pm.PackageManager
 import android.provider.Settings
+import android.media.projection.MediaProjectionManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -53,6 +56,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationManagerCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -81,17 +85,26 @@ internal val Languages = listOf(
 class MainActivity : ComponentActivity() {
     private var incomingAudioUri by mutableStateOf<Uri?>(null)
     private var floatingButtonEnabled by mutableStateOf(false)
+    private var screenCaptureRequested by mutableStateOf(false)
+    private var screenRecognizedText by mutableStateOf<String?>(null)
+    private var screenCaptureError by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        incomingAudioUri = sharedAudioFrom(intent)
+        applyIncomingIntent(intent)
         floatingButtonEnabled = FloatingTranslatorService.isEnabled(this)
         setContent {
             TranslatorApp(
                 incomingAudioUri = incomingAudioUri,
                 floatingButtonEnabled = floatingButtonEnabled,
+                screenCaptureRequested = screenCaptureRequested,
+                screenRecognizedText = screenRecognizedText,
+                screenCaptureError = screenCaptureError,
                 onIncomingAudioConsumed = { incomingAudioUri = null },
                 onFloatingButtonChanged = { floatingButtonEnabled = it },
+                onScreenCaptureRequestConsumed = { screenCaptureRequested = false },
+                onScreenCaptureError = { screenCaptureError = it },
+                onClearScreenResult = { screenRecognizedText = null },
             )
         }
     }
@@ -108,7 +121,28 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        incomingAudioUri = sharedAudioFrom(intent)
+        applyIncomingIntent(intent)
+    }
+
+    private fun applyIncomingIntent(intent: Intent) {
+        when (intent.action) {
+            ScreenTranslationService.ACTION_REQUEST_CAPTURE -> {
+                incomingAudioUri = null
+                screenRecognizedText = null
+                screenCaptureError = null
+                screenCaptureRequested = true
+            }
+            ScreenTranslationService.ACTION_SHOW_RESULT -> {
+                incomingAudioUri = null
+                screenCaptureRequested = false
+                screenRecognizedText = intent.getStringExtra(ScreenTranslationService.EXTRA_OCR_TEXT)
+                screenCaptureError = intent.getStringExtra(ScreenTranslationService.EXTRA_OCR_ERROR)
+            }
+            else -> {
+                screenCaptureRequested = false
+                incomingAudioUri = sharedAudioFrom(intent)
+            }
+        }
     }
 }
 
@@ -116,21 +150,46 @@ class MainActivity : ComponentActivity() {
 private fun TranslatorApp(
     incomingAudioUri: Uri?,
     floatingButtonEnabled: Boolean,
+    screenCaptureRequested: Boolean,
+    screenRecognizedText: String?,
+    screenCaptureError: String?,
     onIncomingAudioConsumed: () -> Unit,
     onFloatingButtonChanged: (Boolean) -> Unit,
+    onScreenCaptureRequestConsumed: () -> Unit,
+    onScreenCaptureError: (String?) -> Unit,
+    onClearScreenResult: () -> Unit,
 ) {
     val context = LocalContext.current
-    var serverUrl by remember { mutableStateOf("http://10.0.2.2:5000") }
+    val settings = remember(context) {
+        context.getSharedPreferences(ScreenTranslationService.SETTINGS, Context.MODE_PRIVATE)
+    }
+    var serverUrl by remember {
+        mutableStateOf(settings.getString(ScreenTranslationService.KEY_SERVER_URL, "http://10.0.2.2:5000") ?: "http://10.0.2.2:5000")
+    }
     var source by remember { mutableStateOf(Languages.first { it.code == "en" }) }
-    var target by remember { mutableStateOf(Languages.first { it.code == "es" }) }
+    var target by remember {
+        mutableStateOf(
+            Languages.firstOrNull { it.code == settings.getString(ScreenTranslationService.KEY_TARGET_LANGUAGE, "es") }
+                ?: Languages.first { it.code == "es" },
+        )
+    }
     var input by remember { mutableStateOf("") }
     var translatedText by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var isTranslating by remember { mutableStateOf(false) }
-    var selectedTab by remember { mutableStateOf(0) }
+    var selectedTab by remember {
+        mutableStateOf(if (screenRecognizedText != null || screenCaptureError != null) 2 else 0)
+    }
     var voiceCaptureActive by remember { mutableStateOf(false) }
     var floatingPermissionMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    androidx.compose.runtime.LaunchedEffect(serverUrl, target.code) {
+        settings.edit()
+            .putString(ScreenTranslationService.KEY_SERVER_URL, serverUrl)
+            .putString(ScreenTranslationService.KEY_TARGET_LANGUAGE, target.code)
+            .apply()
+    }
 
     fun startFloatingButton() {
         FloatingTranslatorService.show(context)
@@ -163,6 +222,64 @@ private fun TranslatorApp(
         }
     }
 
+    val captureConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val resultData = result.data
+        if (result.resultCode == Activity.RESULT_OK && resultData != null) {
+            try {
+                val serviceIntent = Intent(context, ScreenTranslationService::class.java)
+                    .putExtra(ScreenTranslationService.EXTRA_RESULT_CODE, result.resultCode)
+                    .putExtra(ScreenTranslationService.EXTRA_RESULT_DATA, resultData)
+                ContextCompat.startForegroundService(context, serviceIntent)
+                onScreenCaptureRequestConsumed()
+                (context.findActivity() as? Activity)?.finish()
+            } catch (exception: Exception) {
+                onScreenCaptureRequestConsumed()
+                onScreenCaptureError(exception.message ?: "Could not start the one-time screen capture.")
+                restoreFloatingButtonIfEnabled(context)
+            }
+        } else {
+            onScreenCaptureRequestConsumed()
+            onScreenCaptureError("Screen capture was canceled. No screenshot was taken.")
+            restoreFloatingButtonIfEnabled(context)
+        }
+    }
+
+    val captureNotificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted && NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            captureConsent.launch(manager.createScreenCaptureIntent())
+        } else {
+            onScreenCaptureRequestConsumed()
+            onScreenCaptureError("Allow notifications to receive and open the screen translation result, then try again.")
+            restoreFloatingButtonIfEnabled(context)
+        }
+    }
+
+    fun requestScreenCapture() {
+        selectedTab = 2
+        onClearScreenResult()
+        onScreenCaptureError(null)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            captureNotificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            onScreenCaptureError("Enable notifications for Universal Translator in Android Settings to receive screen-capture results.")
+            restoreFloatingButtonIfEnabled(context)
+        } else {
+            val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            captureConsent.launch(manager.createScreenCaptureIntent())
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(screenCaptureRequested) {
+        if (screenCaptureRequested) requestScreenCapture()
+    }
+
+    androidx.compose.runtime.LaunchedEffect(screenRecognizedText, screenCaptureError) {
+        if (screenRecognizedText != null || screenCaptureError != null) selectedTab = 2
+    }
+
     androidx.compose.runtime.LaunchedEffect(incomingAudioUri) {
         if (incomingAudioUri != null) selectedTab = 1
     }
@@ -187,7 +304,7 @@ private fun TranslatorApp(
                 Text("UNIVERSAL", color = Teal, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.8.sp)
                 Text("Translator", color = Ink, fontSize = 32.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(6.dp))
-                Text("Free text and voice note translation", color = Muted, fontSize = 15.sp)
+                Text("Free text, voice note and screen translation", color = Muted, fontSize = 15.sp)
                 Spacer(Modifier.height(26.dp))
 
                 Row(
@@ -221,7 +338,7 @@ private fun TranslatorApp(
                     )
                 }
                 Text(
-                    "When enabled, a small draggable button appears over other apps. Android's overlay access is required; a persistent notification lets you hide it quickly.",
+                    "When enabled, tap the draggable button in another app to request a one-time screen capture. Android asks before every capture; the notification lets you hide the button.",
                     color = Muted,
                     fontSize = 12.sp,
                     lineHeight = 17.sp,
@@ -239,6 +356,7 @@ private fun TranslatorApp(
                         text = { Text("Text") },
                     )
                     Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Voice note") })
+                    Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("Screen") })
                 }
                 Spacer(Modifier.height(18.dp))
 
@@ -246,6 +364,15 @@ private fun TranslatorApp(
                     VoiceNoteScreen(serverUrl, incomingAudioUri, onIncomingAudioConsumed) { active ->
                         voiceCaptureActive = active
                     }
+                } else if (selectedTab == 2) {
+                    ScreenTranslationScreen(
+                        recognizedText = screenRecognizedText,
+                        captureError = screenCaptureError,
+                        serverUrl = serverUrl,
+                        targetLanguage = target,
+                        onTargetLanguageChanged = { target = it },
+                        onRequestCapture = ::requestScreenCapture,
+                    )
                 } else {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -390,6 +517,18 @@ private fun sharedAudioFrom(intent: Intent?): Uri? {
         Intent.ACTION_SEND_MULTIPLE -> intent.audioStreams().firstOrNull()
         Intent.ACTION_VIEW -> intent.data
         else -> null
+    }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is android.content.ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+private fun restoreFloatingButtonIfEnabled(context: Context) {
+    if (Settings.canDrawOverlays(context) && FloatingTranslatorService.isEnabled(context)) {
+        FloatingTranslatorService.restoreAfterCapture(context)
     }
 }
 

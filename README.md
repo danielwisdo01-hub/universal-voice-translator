@@ -42,19 +42,35 @@ Use an Android 13+ emulator or device with an offline speech recognition model a
 
 ## Stage 3: floating translator button
 
-- Use the **Floating button** switch on the home screen to show or hide a small draggable button above other apps.
+- Use the **Floating button** switch on the home screen to show or hide a small draggable button above other apps. Tapping the button now requests a one-time screen-text capture.
 - The first enable opens Android's **Display over other apps** settings for this app. The button appears only after the user grants this special access.
 - Android also runs a foreground service while the button is visible. Its ongoing low-priority notification has a **Hide button** action. Android 13+ may request notification permission; declining it does not prevent the overlay from running, and the button can still be hidden from the app.
-- Drag the button to move it; when released it snaps to the nearest screen edge. Tap it to open Universal Translator. Its position is remembered.
+- Drag the button to move it; when released it snaps to the nearest screen edge. Its position is remembered. The notification's open action still opens Universal Translator directly.
 - The service starts only when enabled by the user; it does not start at boot.
 
 ## Test Stage 3
 
 1. Run the app and turn on **Floating button**.
 2. On the Android settings page, grant **Display over other apps**, then return to the app. Grant notification access if desired.
-3. Confirm the button appears above the launcher or another app. Drag it to each side, tap it to reopen Universal Translator, and confirm the notification's **Hide button** action removes it.
+3. Confirm the button appears above the launcher or another app. Drag it to each side, then confirm the notification's **Hide button** action removes it.
 4. Re-enable it, return to the app, and turn the switch off. Confirm the bubble and its ongoing notification are removed.
 5. Revoke overlay access in Android Settings and return to the app. The service should stop and the switch should be off.
+
+## Stage 4: screen-message translation
+
+- Tapping the floating button opens the app and requests notification access if needed, followed by Android's system screen-capture consent. Each capture requires a fresh confirmation; canceling takes no screenshot.
+- After consent, the app returns to the previous screen, captures one frame in a foreground service, hides the bubble during capture, and runs bundled, no-cost on-device ML Kit text recognition. The screenshot is held in memory and is not saved. A generic notification (without detected text) opens the review screen.
+- The review screen displays editable detected text and translates it to the app's selected target language using the configured LibreTranslate server. The detected text is sent to that server only after the user opens the result. It can be read using an installed offline Android TTS voice or copied to the clipboard.
+
+The bundled ML Kit recognizer uses Latin script; text in other scripts may not be detected reliably. Translation needs the configured LibreTranslate server and network access. The result is delivered through Android notifications, so notifications must be enabled. Android can block screen capture on protected/secure content, and some system screens exclude capture. Screen capture is never continuous or started at boot.
+
+## Test Stage 4
+
+1. Enable the floating button and grant overlay access. Enable notifications for the app.
+2. Open another app with readable text, then tap the floating button.
+3. Approve Android's screen-capture prompt. Confirm the prior app returns briefly, the floating bubble hides during capture, and a result notification appears.
+4. Tap **Review translation**. Confirm detected text is displayed and translated into the target language selected in the app. Try read-aloud and copy.
+5. Repeat and cancel the system prompt; confirm no result is produced. Try a secure screen to check Android's capture restriction behavior.
 
 The overlay can cover the small area occupied by its bubble, so move it away from important controls or hide it when not needed. Android may suppress overlays on protected system screens. Android 14+ requires the declared `specialUse` foreground-service type; app-store distribution may require review and approval of this foreground-service use under current Play policy.
 
