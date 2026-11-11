@@ -2,9 +2,14 @@ package com.universalvoicetranslator
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.content.pm.PackageManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,6 +34,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -39,12 +45,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -72,13 +80,29 @@ internal val Languages = listOf(
 
 class MainActivity : ComponentActivity() {
     private var incomingAudioUri by mutableStateOf<Uri?>(null)
+    private var floatingButtonEnabled by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         incomingAudioUri = sharedAudioFrom(intent)
+        floatingButtonEnabled = FloatingTranslatorService.isEnabled(this)
         setContent {
-            TranslatorApp(incomingAudioUri) { incomingAudioUri = null }
+            TranslatorApp(
+                incomingAudioUri = incomingAudioUri,
+                floatingButtonEnabled = floatingButtonEnabled,
+                onIncomingAudioConsumed = { incomingAudioUri = null },
+                onFloatingButtonChanged = { floatingButtonEnabled = it },
+            )
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val overlayAllowed = Settings.canDrawOverlays(this)
+        if (!overlayAllowed && FloatingTranslatorService.isEnabled(this)) {
+            FloatingTranslatorService.hide(this)
+        }
+        floatingButtonEnabled = overlayAllowed && FloatingTranslatorService.isEnabled(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -89,7 +113,13 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun TranslatorApp(incomingAudioUri: Uri?, onIncomingAudioConsumed: () -> Unit) {
+private fun TranslatorApp(
+    incomingAudioUri: Uri?,
+    floatingButtonEnabled: Boolean,
+    onIncomingAudioConsumed: () -> Unit,
+    onFloatingButtonChanged: (Boolean) -> Unit,
+) {
+    val context = LocalContext.current
     var serverUrl by remember { mutableStateOf("http://10.0.2.2:5000") }
     var source by remember { mutableStateOf(Languages.first { it.code == "en" }) }
     var target by remember { mutableStateOf(Languages.first { it.code == "es" }) }
@@ -99,7 +129,39 @@ private fun TranslatorApp(incomingAudioUri: Uri?, onIncomingAudioConsumed: () ->
     var isTranslating by remember { mutableStateOf(false) }
     var selectedTab by remember { mutableStateOf(0) }
     var voiceCaptureActive by remember { mutableStateOf(false) }
+    var floatingPermissionMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    fun startFloatingButton() {
+        FloatingTranslatorService.show(context)
+        floatingPermissionMessage = null
+        onFloatingButtonChanged(true)
+    }
+
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) {
+            floatingPermissionMessage = "Notification access was declined. The overlay can still run; stop it here or from Android's Active apps controls."
+        }
+        startFloatingButton()
+    }
+
+    fun requestNotificationOrStart() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            startFloatingButton()
+        }
+    }
+
+    val overlaySettings = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (Settings.canDrawOverlays(context)) {
+            requestNotificationOrStart()
+        } else {
+            floatingPermissionMessage = "Allow display over other apps in Android Settings to enable the floating button."
+        }
+    }
 
     androidx.compose.runtime.LaunchedEffect(incomingAudioUri) {
         if (incomingAudioUri != null) selectedTab = 1
@@ -127,6 +189,47 @@ private fun TranslatorApp(incomingAudioUri: Uri?, onIncomingAudioConsumed: () ->
                 Spacer(Modifier.height(6.dp))
                 Text("Free text and voice note translation", color = Muted, fontSize = 15.sp)
                 Spacer(Modifier.height(26.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Floating button", color = Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Show above other apps", color = Muted, fontSize = 13.sp)
+                    }
+                    Switch(
+                        checked = floatingButtonEnabled,
+                        onCheckedChange = { enabled ->
+                            if (!enabled) {
+                                FloatingTranslatorService.hide(context)
+                                onFloatingButtonChanged(false)
+                                floatingPermissionMessage = null
+                            } else if (Settings.canDrawOverlays(context)) {
+                                requestNotificationOrStart()
+                            } else {
+                                floatingPermissionMessage = "Android requires your approval before the button can appear over other apps."
+                                overlaySettings.launch(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:${context.packageName}"),
+                                    ),
+                                )
+                            }
+                        },
+                    )
+                }
+                Text(
+                    "When enabled, a small draggable button appears over other apps. Android's overlay access is required; a persistent notification lets you hide it quickly.",
+                    color = Muted,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                )
+                floatingPermissionMessage?.let { message ->
+                    Text(message, color = if (floatingButtonEnabled) Muted else Color(0xFFB3261E), fontSize = 12.sp)
+                }
+                Spacer(Modifier.height(18.dp))
 
                 TabRow(selectedTabIndex = selectedTab) {
                     Tab(
